@@ -1,0 +1,10 @@
+{
+  "Name": "LaserEye",
+  "Author": "鹈鹕镇的小凯",
+  "Version": "1.0.0",
+  "Description": "镭射眼",
+  "UniqueID": "Kyle.LaserEye",
+  "EntryDll": "LaserEye.dll",
+  "MinimumApiVersion": "4.0.0",
+  "UpdateKeys": []
+}

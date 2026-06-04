@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <AssemblyName>LaserEye</AssemblyName>
+    <RootNamespace>LaserEye</RootNamespace>
+    <Version>1.0.1</Version>
+    <TargetFramework>net6.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- 部署到项目目录，避免游戏运行时锁定 Mods 导致构建失败 -->
+    <EnableModDeploy>true</EnableModDeploy>
+    <EnableModZip>true</EnableModZip>
+    <GameModsPath>$(MSBuildProjectDirectory)\bin\ModDeploy</GameModsPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Pathoschild.Stardew.ModBuildConfig" Version="4.4.0" />
+  </ItemGroup>
+
+  <!-- CompoundNo5.png 若被标记为只读，ModDeploy 覆盖时会构建失败 -->
+  <Target Name="ClearReadOnlyAssets" BeforeTargets="AfterBuild">
+    <Exec Condition="'$(OS)' == 'Windows_NT'"
+          Command="cmd /C attrib -R &quot;$(MSBuildProjectDirectory)\assets\*.*&quot; /S /D &amp; if exist &quot;$(MSBuildProjectDirectory)\bin\ModDeploy&quot; attrib -R &quot;$(MSBuildProjectDirectory)\bin\ModDeploy\*.*&quot; /S /D" />
+  </Target>
+
+</Project>
