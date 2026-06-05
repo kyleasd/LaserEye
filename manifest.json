@@ -6,5 +6,5 @@
   "UniqueID": "Kyle.LaserEye",
   "EntryDll": "LaserEye.dll",
   "MinimumApiVersion": "4.0.0",
-  "UpdateKeys": []
+  "UpdateKeys": [ "Nexus:47181" ]
 }
