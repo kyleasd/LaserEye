@@ -1,10 +1,22 @@
 {
+
   "Name": "LaserEye",
+
   "Author": "鹈鹕镇的小凯",
-  "Version": "1.0.0",
+
+  "Version": "1.1.0",
+
   "Description": "镭射眼",
+
   "UniqueID": "Kyle.LaserEye",
+
   "EntryDll": "LaserEye.dll",
+
   "MinimumApiVersion": "4.0.0",
+
+  "MinimumGameVersion": "1.6.0",
+
   "UpdateKeys": [ "Nexus:47181" ]
+
 }
+

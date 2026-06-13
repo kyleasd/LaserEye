@@ -3,7 +3,7 @@
   <PropertyGroup>
     <AssemblyName>LaserEye</AssemblyName>
     <RootNamespace>LaserEye</RootNamespace>
-    <Version>1.0.1</Version>
+    <Version>1.1.0</Version>
     <TargetFramework>net6.0</TargetFramework>
     <LangVersion>latest</LangVersion>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -16,6 +16,10 @@
 
   <ItemGroup>
     <PackageReference Include="Pathoschild.Stardew.ModBuildConfig" Version="4.4.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="config.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <!-- CompoundNo5.png 若被标记为只读，ModDeploy 覆盖时会构建失败 -->

@@ -8,7 +8,7 @@ using StardewValley;
 using StardewValley.Buffs;
 using StardewValley.GameData;
 using StardewValley.GameData.Shops;
-using StardewValley.Menus;
+using StardewValley.Objects;
 using StardewValley.Objects.Trinkets;
 using StardewValley.TerrainFeatures;
 using StardewValley.Tools;
@@ -103,6 +103,18 @@ internal sealed class ModEntry : Mod
     /// <summary>侧脸两眼前后错开的深度（朝右时近眼更靠右）。</summary>
     private const float HorizontalEyeDepthOffset = 4f;
 
+    /// <summary>联机爆炸请求的 SMAPI 消息类型。</summary>
+    private const string LaserExplodeMessageType = "laser-explode";
+
+    /// <summary>联机镭射光束绘制的 SMAPI 消息类型。</summary>
+    private const string LaserVisualMessageType = "laser-visual";
+
+    /// <summary>联机爆炸特效（火球/音效）的 SMAPI 消息类型。</summary>
+    private const string LaserExplodeVisualMessageType = "laser-explode-visual";
+
+    /// <summary>远端镭射状态超过此 tick 数未更新则清除。</summary>
+    private const int RemoteLaserVisualTimeoutTicks = 30;
+
     /// <summary>每次爆炸时在鼠标位置散开的火球数量。</summary>
     private const int FireballScatterCount = 10;
 
@@ -116,8 +128,8 @@ internal sealed class ModEntry : Mod
     private Vector2 _lastDestroyCenterTile = new(-9999, -9999);
     private int _destroyCooldownRemainingMs;
 
-    /// <summary>处于菜单/暂停等不可发射状态后，需先松开鼠标左键才能再次发射，避免点击关闭对话框时误触发。</summary>
-    private bool _requireMouseRelease;
+    /// <summary>处于菜单/暂停等不可发射状态后，需先松开发射键才能再次发射，避免误触发。</summary>
+    private bool _requireFireKeyRelease;
 
     /// <summary>防止同一帧内重复触发喝牛奶回体。</summary>
     private int _lastMilkStaminaBonusTick = -1;
@@ -131,28 +143,54 @@ internal sealed class ModEntry : Mod
     /// <summary>光束直线延伸进度（0 = 眼眶，1 = 鼠标）。</summary>
     private float _laserExtendProgress;
 
+    /// <summary>上一帧是否正在向其他玩家同步镭射绘制状态。</summary>
+    private bool _wasSyncingLaserVisual;
+
+    /// <summary>其他玩家在当前地点的镭射绘制状态。</summary>
+    private readonly Dictionary<long, RemoteLaserVisual> _remoteLaserVisuals = new();
+
+    /// <summary>当前是否为 Android 平台（移动端使用触屏点击发射）。</summary>
+    private static readonly bool IsMobilePlatform = OperatingSystem.IsAndroid();
+
+    /// <summary>Mod 配置。</summary>
+    private ModConfig _config = null!;
+
+    /// <summary>当前 mod 配置（供 GMCM 读写）。</summary>
+    internal ModConfig Config => _config;
+
     /// <summary>The mod entry point, called after the mod is first loaded.</summary>
     /// <param name="helper">Provides simplified APIs for writing mods.</param>
     public override void Entry(IModHelper helper)
     {
+        _config = helper.ReadConfig<ModConfig>();
         _buffIcon = helper.ModContent.Load<Texture2D>(BuffIconPath);
+
+        GmcmIntegration.Register(this, helper);
 
         helper.Events.Content.AssetRequested += OnAssetRequested;
         helper.Events.Display.RenderedWorld += OnRenderedWorld;
         helper.Events.GameLoop.UpdateTicked += OnUpdateTicked;
         helper.Events.Input.ButtonPressed += OnButtonPressed;
+        helper.Events.Multiplayer.ModMessageReceived += OnModMessageReceived;
         helper.Events.Player.InventoryChanged += OnInventoryChanged;
         helper.Events.Player.Warped += (_, _) =>
         {
             ResetDestroyState();
             _pendingMilkStaminaBonusRatio = null;
             _wasEating = false;
+            StopSyncingLaserVisual();
         };
 
         helper.ConsoleCommands.Add(
             "give_lasereye",
             "获得镭射眼饰品（5号化合物）。",
             (_, __) => Game1.player.addItemByMenuIfNecessary(ItemRegistry.Create(LaserEyeTrinketQualifiedId)));
+    }
+
+    /// <summary>将配置重置为默认值（供 GMCM 调用）。</summary>
+    internal void ResetConfig()
+    {
+        _config = new ModConfig();
     }
 
     /// <summary>加载饰品贴图，并注册饰品、制作配方与齐钻商店条目。</summary>
@@ -189,7 +227,7 @@ internal sealed class ModEntry : Mod
                 // 配方键必须与饰品 Item.Name/BaseName 一致，否则 LearnRecipe 与商店预览都会匹配失败（回退为火把）。
                 // 910=放射性矿锭, 337=铱锭, 186=大瓶牛奶, 438=大瓶羊奶, 74=五彩碎片
                 asset.AsDictionary<string, string>().Data[LaserEyeTrinketId] =
-                    "(O)910 88 (O)337 88 (O)186 88 (O)438 88 (O)74 1/Home/(TR)Kyle.LaserEye_LaserEyeBox/false/null/";
+                    "(O)910 18 (O)337 18 (O)186 18 (O)438 18 (O)74 1/Home/(TR)Kyle.LaserEye_LaserEyeBox/false/null/";
             });
             return;
         }
@@ -216,14 +254,14 @@ internal sealed class ModEntry : Mod
         }
     }
 
-    /// <summary>左键按下快捷栏时立即屏蔽激光，避免与 UpdateTicked 时序竞争。</summary>
+    /// <summary>按下发射键且鼠标在快捷栏上时立即屏蔽激光，避免与 UpdateTicked 时序竞争。</summary>
     private void OnButtonPressed(object? sender, ButtonPressedEventArgs e)
     {
-        if (e.Button != SButton.MouseLeft || !Context.IsWorldReady)
+        if (!Context.IsWorldReady || !IsFireButton(e.Button))
             return;
 
-        if (IsMouseOverToolbar())
-            _requireMouseRelease = true;
+        if (UsesMouseLeftFireKey() && IsMouseOverToolbar())
+            _requireFireKeyRelease = true;
     }
 
     /// <summary>Apply vanilla bomb destruction at the mouse when left-clicking (throttled).</summary>
@@ -231,55 +269,245 @@ internal sealed class ModEntry : Mod
     {
         UpdateAllWinStanceBuff();
         UpdatePendingMilkStaminaBonus();
+        PruneStaleRemoteLaserVisuals();
 
         if (!CanFireLaser())
         {
-            // 进入菜单/暂停等状态后，要求松开鼠标左键才能再次发射。
-            _requireMouseRelease = true;
+            // 进入菜单/暂停等状态后，要求松开发射键才能再次发射。
+            _requireFireKeyRelease = true;
             ResetDestroyState();
+            StopSyncingLaserVisual();
             return;
         }
 
-        if (!IsLeftMousePressed())
-            _requireMouseRelease = false;
+        if (!IsFireKeyPressed())
+            _requireFireKeyRelease = false;
 
         if (_destroyCooldownRemainingMs > 0)
             _destroyCooldownRemainingMs -= (int)Game1.currentGameTime.ElapsedGameTime.TotalMilliseconds;
 
-        if (!IsWearingLaserEyeTrinket() || !IsLeftMousePressed() || _requireMouseRelease)
+        if (!IsWearingLaserEyeTrinket() || !IsFireKeyPressed() || _requireFireKeyRelease)
         {
             ResetDestroyState();
+            StopSyncingLaserVisual();
             return;
         }
 
-        if (IsMouseOverToolbar())
+        if (UsesMouseLeftFireKey() && IsMouseOverToolbar())
         {
-            _requireMouseRelease = true;
+            _requireFireKeyRelease = true;
             ResetDestroyState();
+            StopSyncingLaserVisual();
             return;
         }
 
         UpdateLaserExtendProgress();
 
+        var location = Game1.currentLocation;
+        if (location == null)
+        {
+            StopSyncingLaserVisual();
+            return;
+        }
+
+        var mouseWorld = GetMouseWorldPosition();
+        BroadcastLaserVisual(location, mouseWorld, active: true);
+
         if (_laserExtendProgress < 1f)
             return;
 
-        var location = Game1.currentLocation;
-        if (location == null)
-            return;
-
-        var centerTile = GetMouseTile(GetMouseWorldPosition());
+        var centerTile = GetMouseTile(mouseWorld);
         if (centerTile == _lastDestroyCenterTile && _destroyCooldownRemainingMs > 0)
             return;
 
         int bombRadius = GetBombRadiusByStamina();
-        var mouseWorld = GetMouseWorldPosition();
         PlayExplosionSound();
         SpawnFireballScatter(mouseWorld, location);
-        ApplyBombDestruction(centerTile, location, bombRadius);
+        BroadcastLaserExplodeVisual(mouseWorld, location);
+        if (Game1.IsMasterGame)
+            ApplyBombDestruction(centerTile, location, bombRadius, Game1.player);
+        else if (Context.IsMultiplayer)
+            SendLaserExplodeMessage(centerTile, location, bombRadius);
+
+        MobileCompat.TryRumble(1f, 300 + bombRadius * 100);
         ConsumeStamina();
         _lastDestroyCenterTile = centerTile;
         _destroyCooldownRemainingMs = DestroyCooldownMs;
+    }
+
+    private bool ShouldDrawLocalLaser()
+    {
+        return CanFireLaser()
+            && !_requireFireKeyRelease
+            && IsWearingLaserEyeTrinket()
+            && IsFireKeyPressed()
+            && !(UsesMouseLeftFireKey() && IsMouseOverToolbar());
+    }
+
+    private void StopSyncingLaserVisual()
+    {
+        if (!_wasSyncingLaserVisual)
+            return;
+
+        GameLocation? location = Game1.currentLocation;
+        if (location != null)
+            BroadcastLaserVisual(location, Vector2.Zero, active: false);
+
+        _wasSyncingLaserVisual = false;
+    }
+
+    private void BroadcastLaserVisual(GameLocation location, Vector2 targetWorld, bool active)
+    {
+        if (!Context.IsMultiplayer)
+            return;
+
+        Helper.Multiplayer.SendMessage(
+            new LaserVisualMessage
+            {
+                Active = active,
+                TargetWorldX = targetWorld.X,
+                TargetWorldY = targetWorld.Y,
+                ExtendProgress = _laserExtendProgress,
+                Trajectory = _config.Trajectory.ToString(),
+                LocationName = GetLocationKey(location),
+            },
+            LaserVisualMessageType,
+            modIDs: [ModManifest.UniqueID]);
+
+        _wasSyncingLaserVisual = active;
+    }
+
+    private void BroadcastLaserExplodeVisual(Vector2 worldPosition, GameLocation location)
+    {
+        if (!Context.IsMultiplayer)
+            return;
+
+        Helper.Multiplayer.SendMessage(
+            new LaserExplodeVisualMessage
+            {
+                WorldX = worldPosition.X,
+                WorldY = worldPosition.Y,
+                LocationName = GetLocationKey(location),
+            },
+            LaserExplodeVisualMessageType,
+            modIDs: [ModManifest.UniqueID]);
+    }
+
+    private void PruneStaleRemoteLaserVisuals()
+    {
+        if (_remoteLaserVisuals.Count == 0)
+            return;
+
+        int now = Game1.ticks;
+        List<long>? expired = null;
+
+        foreach ((long playerId, RemoteLaserVisual visual) in _remoteLaserVisuals)
+        {
+            if (!visual.Active || now - visual.LastUpdateTick > RemoteLaserVisualTimeoutTicks)
+                (expired ??= new List<long>()).Add(playerId);
+        }
+
+        if (expired == null)
+            return;
+
+        foreach (long playerId in expired)
+            _remoteLaserVisuals.Remove(playerId);
+    }
+
+    /// <summary>客机将爆炸请求发给主持农场，由主机执行地图破坏。</summary>
+    private void SendLaserExplodeMessage(Vector2 centerTile, GameLocation location, int radius)
+    {
+        Helper.Multiplayer.SendMessage(
+            new LaserExplodeMessage
+            {
+                CenterTileX = centerTile.X,
+                CenterTileY = centerTile.Y,
+                Radius = radius,
+                LocationName = GetLocationKey(location),
+            },
+            LaserExplodeMessageType,
+            modIDs: [ModManifest.UniqueID],
+            playerIDs: [Game1.MasterPlayer.UniqueMultiplayerID]);
+    }
+
+    /// <summary>处理联机消息：客机爆炸请求（仅主机）与其它玩家的视觉同步。</summary>
+    private void OnModMessageReceived(object? sender, ModMessageReceivedEventArgs e)
+    {
+        if (e.FromModID != ModManifest.UniqueID || !Context.IsWorldReady)
+            return;
+
+        if (e.Type == LaserVisualMessageType)
+        {
+            HandleLaserVisualMessage(e);
+            return;
+        }
+
+        if (e.Type == LaserExplodeVisualMessageType)
+        {
+            HandleLaserExplodeVisualMessage(e);
+            return;
+        }
+
+        if (e.Type != LaserExplodeMessageType || !Game1.IsMasterGame)
+            return;
+
+        LaserExplodeMessage message = e.ReadAs<LaserExplodeMessage>();
+        Farmer? farmer = Game1.GetPlayer(e.FromPlayerID);
+        if (farmer == null || !IsWearingLaserEyeTrinket(farmer))
+            return;
+
+        GameLocation? location = Game1.getLocationFromName(message.LocationName);
+        if (location == null || farmer.currentLocation != location)
+            return;
+
+        var centerTile = new Vector2(message.CenterTileX, message.CenterTileY);
+        ApplyBombDestruction(centerTile, location, message.Radius, farmer);
+    }
+
+    private void HandleLaserVisualMessage(ModMessageReceivedEventArgs e)
+    {
+        if (e.FromPlayerID == Game1.player.UniqueMultiplayerID)
+            return;
+
+        LaserVisualMessage message = e.ReadAs<LaserVisualMessage>();
+        if (!message.Active)
+        {
+            _remoteLaserVisuals.Remove(e.FromPlayerID);
+            return;
+        }
+
+        if (!Enum.TryParse(message.Trajectory, ignoreCase: true, out LaserTrajectoryType trajectory))
+            trajectory = LaserTrajectoryType.Curved;
+
+        _remoteLaserVisuals[e.FromPlayerID] = new RemoteLaserVisual
+        {
+            TargetWorld = new Vector2(message.TargetWorldX, message.TargetWorldY),
+            ExtendProgress = message.ExtendProgress,
+            Trajectory = trajectory,
+            LocationName = message.LocationName,
+            LastUpdateTick = Game1.ticks,
+            Active = true,
+        };
+    }
+
+    private void HandleLaserExplodeVisualMessage(ModMessageReceivedEventArgs e)
+    {
+        if (e.FromPlayerID == Game1.player.UniqueMultiplayerID)
+            return;
+
+        LaserExplodeVisualMessage message = e.ReadAs<LaserExplodeVisualMessage>();
+        GameLocation? location = Game1.currentLocation;
+        if (location == null || GetLocationKey(location) != message.LocationName)
+            return;
+
+        var worldPosition = new Vector2(message.WorldX, message.WorldY);
+        PlayExplosionSound();
+        SpawnFireballScatter(worldPosition, location);
+    }
+
+    private static string GetLocationKey(GameLocation location)
+    {
+        return string.IsNullOrEmpty(location.uniqueName.Value) ? location.Name : location.uniqueName.Value;
     }
 
     /// <summary>
@@ -335,32 +563,76 @@ internal sealed class ModEntry : Mod
         _laserExtendProgress = System.Math.Min(1f, _laserExtendProgress + elapsedSeconds / LaserExtendDurationSeconds);
     }
 
-    /// <summary>Vanilla bomb tile destruction (host only).</summary>
-    private static void ApplyBombDestruction(Vector2 centerTile, GameLocation location, int radius)
+    /// <summary>原版炸弹式地图破坏（仅主持农场执行）。</summary>
+    private static void ApplyBombDestruction(Vector2 centerTile, GameLocation location, int radius, Farmer farmer)
     {
         if (!Game1.IsMasterGame)
             return;
 
-        location.explode(centerTile, radius, Game1.player, damageFarmers: false, destroyObjects: true);
-        DestroyResourceClumps(centerTile, location, radius);
-        Rumble.rumbleAndFade(1f, 300 + radius * 100);
+        location.explode(centerTile, radius, farmer, damageFarmers: false, destroyObjects: true);
+        DestroyResourceClumps(centerTile, location, radius, farmer);
+        DestroyCrabPotsInArea(centerTile, location, radius);
+    }
+
+    private static Rectangle GetExplosionPixelArea(Vector2 centerTile, int radius)
+    {
+        int left = (int)((centerTile.X - radius) * Game1.tileSize);
+        int top = (int)((centerTile.Y - radius) * Game1.tileSize);
+        int size = (radius * 2 + 1) * Game1.tileSize;
+        return new Rectangle(left, top, size, size);
+    }
+
+    /// <summary>
+    /// 原版 explode 不会摧毁蟹笼（destroyObject 要求 CanBeGrabbed）。
+    /// 镭射爆炸时显式清除范围内蟹笼，并掉落笼内收获物与诱饵。
+    /// </summary>
+    private static void DestroyCrabPotsInArea(Vector2 centerTile, GameLocation location, int radius)
+    {
+        Rectangle area = GetExplosionPixelArea(centerTile, radius);
+        List<Vector2>? tilesToRemove = null;
+
+        foreach ((Vector2 tile, StardewValley.Object obj) in location.objects.Pairs)
+        {
+            if (obj is not CrabPot crabPot)
+                continue;
+
+            if (!obj.GetBoundingBoxAt((int)tile.X, (int)tile.Y).Intersects(area))
+                continue;
+
+            DestroyCrabPot(crabPot, tile, location);
+            (tilesToRemove ??= new List<Vector2>()).Add(tile);
+        }
+
+        if (tilesToRemove == null)
+            return;
+
+        foreach (Vector2 tile in tilesToRemove)
+            location.objects.Remove(tile);
+    }
+
+    private static void DestroyCrabPot(CrabPot crabPot, Vector2 tile, GameLocation location)
+    {
+        Vector2 dropPos = tile * Game1.tileSize + crabPot.directionOffset.Value + new Vector2(32f, 32f);
+
+        if (crabPot.heldObject.Value != null)
+            location.debris.Add(new Debris(crabPot.heldObject.Value.getOne(), dropPos));
+
+        if (crabPot.bait.Value != null)
+            location.debris.Add(new Debris(crabPot.bait.Value.getOne(), dropPos + new Vector2(16f, 0f)));
+
+        crabPot.performRemoveAction();
     }
 
     /// <summary>
     /// 爆炸不会伤害 ResourceClump（GiantCrop、树桩、原木、巨石、陨石）。
     /// 对范围内的 clump 模拟斧头砍伐直至摧毁；GiantCrop 会按原版逻辑掉落产物。
     /// </summary>
-    private static void DestroyResourceClumps(Vector2 centerTile, GameLocation location, int radius)
+    private static void DestroyResourceClumps(Vector2 centerTile, GameLocation location, int radius, Farmer farmer)
     {
         if (location.resourceClumps == null || location.resourceClumps.Count == 0)
             return;
 
-        int left = (int)((centerTile.X - radius) * Game1.tileSize);
-        int top = (int)((centerTile.Y - radius) * Game1.tileSize);
-        int size = (radius * 2 + 1) * Game1.tileSize;
-        var area = new Rectangle(left, top, size, size);
-
-        Axe axe = CreateLaserAxe();
+        Rectangle area = GetExplosionPixelArea(centerTile, radius);
 
         for (int i = location.resourceClumps.Count - 1; i >= 0; i--)
         {
@@ -368,25 +640,31 @@ internal sealed class ModEntry : Mod
             if (!clump.getBoundingBox().Intersects(area))
                 continue;
 
-            if (TryDestroyClump(clump, location, axe) && i < location.resourceClumps.Count && location.resourceClumps[i] == clump)
+            Tool tool = CreateLaserTool(clump, farmer);
+            if (TryDestroyClump(clump, location, tool) && i < location.resourceClumps.Count && location.resourceClumps[i] == clump)
                 location.resourceClumps.RemoveAt(i);
         }
     }
 
-    private static Axe CreateLaserAxe()
+    /// <summary>镭射破坏 ResourceClump 时使用满级虚拟工具，不读取玩家实际装备等级。</summary>
+    private static Tool CreateLaserTool(ResourceClump clump, Farmer farmer)
     {
-        if (Game1.player.CurrentTool is Axe playerAxe)
-        {
-            playerAxe.lastUser = Game1.player;
-            return playerAxe;
-        }
-
-        var axe = new Axe { UpgradeLevel = 4 };
-        axe.lastUser = Game1.player;
-        return axe;
+        Tool tool = RequiresPickaxe(clump)
+            ? new Pickaxe { UpgradeLevel = 4 }
+            : new Axe { UpgradeLevel = 4 };
+        tool.lastUser = farmer;
+        return tool;
     }
 
-    private static bool TryDestroyClump(ResourceClump clump, GameLocation location, Axe axe)
+    private static bool RequiresPickaxe(ResourceClump clump)
+    {
+        int index = clump.parentSheetIndex.Value;
+        return index == ResourceClump.boulderIndex
+            || index == ResourceClump.meteoriteIndex
+            || index == ResourceClump.quarryBoulderIndex;
+    }
+
+    private static bool TryDestroyClump(ResourceClump clump, GameLocation location, Tool tool)
     {
         if (clump.Location == null)
             clump.Location = location;
@@ -398,7 +676,7 @@ internal sealed class ModEntry : Mod
         {
             for (int hit = 0; hit < 20; hit++)
             {
-                if (clump.performToolAction(axe, 1, toolTile))
+                if (clump.performToolAction(tool, 1, toolTile))
                     return true;
             }
 
@@ -408,8 +686,8 @@ internal sealed class ModEntry : Mod
         // 其它 ResourceClump 同一 swingTicker 只会生效一次，每次命中前递增。
         for (int hit = 0; hit < 50; hit++)
         {
-            axe.swingTicker++;
-            if (clump.performToolAction(axe, 1, toolTile))
+            tool.swingTicker++;
+            if (clump.performToolAction(tool, 1, toolTile))
                 return true;
         }
 
@@ -467,85 +745,62 @@ internal sealed class ModEntry : Mod
         Game1.player.Stamina = System.Math.Max(0f, Game1.player.Stamina - StaminaCostPerShot);
     }
 
-    private static bool IsLeftMousePressed()
+    /// <summary>PC 上使用配置的发射键；Android 上按住屏幕（MouseLeft）发射。</summary>
+    private bool IsFireKeyPressed()
     {
-        return Mouse.GetState().LeftButton == ButtonState.Pressed;
+        if (IsMobilePlatform)
+            return Helper.Input.IsDown(SButton.MouseLeft);
+
+        return Helper.Input.IsDown(_config.FireKey);
     }
 
-    /// <summary>鼠标是否在屏幕底部快捷栏槽位上（与 Toolbar.receiveLeftClick 判定一致）。</summary>
+    private bool IsFireButton(SButton button)
+    {
+        if (IsMobilePlatform)
+            return button == SButton.MouseLeft;
+
+        return button == _config.FireKey;
+    }
+
+    private bool UsesMouseLeftFireKey()
+    {
+        return !IsMobilePlatform && _config.FireKey == SButton.MouseLeft;
+    }
+
+    /// <summary>鼠标是否在屏幕底部快捷栏区域（PC 近似判定，不引用 Toolbar/makeSafeMarginY 以兼容 Android）。</summary>
     private static bool IsMouseOverToolbar()
     {
-        if (!Game1.displayHUD || Game1.activeClickableMenu != null)
+        if (IsMobilePlatform || !Game1.displayHUD || Game1.activeClickableMenu != null)
             return false;
-
-        Toolbar? toolbar = GetToolbar();
-        if (toolbar == null)
-            return false;
-
-        SyncToolbarSlotBounds(toolbar);
 
         Game1.PushUIMode();
         try
         {
             int mouseX = Game1.getMouseX();
             int mouseY = Game1.getMouseY();
-            foreach (ClickableComponent slot in toolbar.buttons)
-            {
-                if (slot.containsPoint(mouseX, mouseY))
-                    return true;
-            }
+            int uiHeight = Game1.uiViewport.Height;
+            int uiWidth = Game1.uiViewport.Width;
+
+            // 12 格快捷栏：水平居中 768px，高度约 128px（与原版布局接近）。
+            if (mouseY < uiHeight - 128)
+                return false;
+
+            int left = uiWidth / 2 - 384;
+            int right = uiWidth / 2 + 384;
+            return mouseX >= left && mouseX < right;
         }
         finally
         {
             Game1.PopUIMode();
-        }
-
-        return false;
-    }
-
-    private static Toolbar? GetToolbar()
-    {
-        foreach (IClickableMenu menu in Game1.onScreenMenus)
-        {
-            if (menu is Toolbar toolbar)
-                return toolbar;
-        }
-
-        return null;
-    }
-
-    /// <summary>按 Toolbar.draw 逻辑同步槽位 bounds（draw 前 bounds 可能过期）。</summary>
-    private static void SyncToolbarSlotBounds(Toolbar toolbar)
-    {
-        int safeMarginY = Utility.makeSafeMarginY(8);
-        Point standingPixel = Game1.player.StandingPixel;
-        Vector2 localFeet = Game1.GlobalToLocal(
-            Game1.viewport,
-            new Vector2(standingPixel.X, standingPixel.Y));
-
-        bool toolbarRaised = !Game1.options.pinToolbarToggle
-            && localFeet.Y > Game1.viewport.Height / 2 + 64;
-
-        int yOnScreen = toolbarRaised
-            ? 112 - 8 + safeMarginY
-            : Game1.uiViewport.Height + 8 - safeMarginY;
-
-        toolbar.yPositionOnScreen = yOnScreen;
-
-        for (int i = 0; i < toolbar.buttons.Count; i++)
-        {
-            toolbar.buttons[i].bounds = new Rectangle(
-                Game1.uiViewport.Width / 2 - 384 + i * 64,
-                yOnScreen - 96 + 8,
-                64,
-                64);
         }
     }
 
     /// <summary>Draw laser lines after the world; when facing up, redraw the player on top.</summary>
     private void OnRenderedWorld(object? sender, RenderedWorldEventArgs e)
     {
-        if (!CanFireLaser() || _requireMouseRelease || !IsWearingLaserEyeTrinket() || !IsLeftMousePressed())
+        DrawRemoteLaserLines(e.SpriteBatch);
+
+        if (!ShouldDrawLocalLaser())
         {
             ResetDestroyState();
             return;
@@ -558,16 +813,48 @@ internal sealed class ModEntry : Mod
         }
 
         var mouseWorld = GetMouseWorldPosition();
-        DrawLaserLines(e.SpriteBatch, mouseWorld);
+        DrawLaserLines(e.SpriteBatch, Game1.player, mouseWorld, _laserExtendProgress, _config.Trajectory);
 
         if (Game1.player.FacingDirection == 0)
             Game1.player.draw(e.SpriteBatch);
     }
 
+    private void DrawRemoteLaserLines(SpriteBatch batch)
+    {
+        if (_remoteLaserVisuals.Count == 0)
+            return;
+
+        GameLocation? currentLocation = Game1.currentLocation;
+        if (currentLocation == null)
+            return;
+
+        string locationKey = GetLocationKey(currentLocation);
+
+        foreach ((long playerId, RemoteLaserVisual visual) in _remoteLaserVisuals)
+        {
+            if (!visual.Active || visual.LocationName != locationKey)
+                continue;
+
+            Farmer? farmer = Game1.GetPlayer(playerId);
+            if (farmer == null || farmer.currentLocation != currentLocation || !IsWearingLaserEyeTrinket(farmer))
+                continue;
+
+            DrawLaserLines(batch, farmer, visual.TargetWorld, visual.ExtendProgress, visual.Trajectory);
+
+            if (farmer.FacingDirection == 0)
+                farmer.draw(batch);
+        }
+    }
+
     /// <summary>玩家是否装备了镭射眼饰品。</summary>
     private static bool IsWearingLaserEyeTrinket()
     {
-        foreach (Trinket? trinket in Game1.player.trinketItems)
+        return IsWearingLaserEyeTrinket(Game1.player);
+    }
+
+    private static bool IsWearingLaserEyeTrinket(Farmer farmer)
+    {
+        foreach (Trinket? trinket in farmer.trinketItems)
         {
             if (trinket?.QualifiedItemId == LaserEyeTrinketQualifiedId)
                 return true;
@@ -705,24 +992,38 @@ internal sealed class ModEntry : Mod
         return item.HasContextTag("cow_milk_item") || item.HasContextTag("goat_milk_item");
     }
 
-    /// <summary>绘制多层镭射光束：先直线延伸至鼠标，再切换为正弦交叉。</summary>
-    private void DrawLaserLines(SpriteBatch batch, Vector2 mouseWorld)
+    /// <summary>绘制多层镭射光束：先直线延伸至鼠标，再切换为正弦交叉或直线。</summary>
+    private static void DrawLaserLines(
+        SpriteBatch batch,
+        Farmer player,
+        Vector2 targetWorld,
+        float extendProgress,
+        LaserTrajectoryType trajectory)
     {
-        var player = Game1.player;
         var tileSize = Game1.tileSize;
         var bodyCenter = player.Position + new Vector2(0f, -tileSize / 2f);
         float pulse = GetLaserPulse();
 
-        if (_laserExtendProgress < 1f)
+        if (extendProgress < 1f)
         {
-            DrawExtendingLaserLines(batch, bodyCenter, mouseWorld, pulse, _laserExtendProgress);
+            DrawExtendingLaserLines(batch, bodyCenter, targetWorld, pulse, extendProgress, player.FacingDirection);
             return;
         }
 
         GetEyePositions(bodyCenter, player.FacingDirection, out Vector2 eyeA, out Vector2 eyeB);
-        DrawLaserBeam(batch, eyeA, mouseWorld, pulse, 0f);
-        DrawLaserBeam(batch, eyeB, mouseWorld, pulse, MathF.PI);
-        DrawImpactGlow(batch, mouseWorld, pulse);
+
+        if (trajectory == LaserTrajectoryType.Curved)
+        {
+            DrawLaserBeam(batch, eyeA, targetWorld, pulse, 0f);
+            DrawLaserBeam(batch, eyeB, targetWorld, pulse, MathF.PI);
+        }
+        else
+        {
+            DrawStraightLaserBeam(batch, eyeA, targetWorld, pulse);
+            DrawStraightLaserBeam(batch, eyeB, targetWorld, pulse);
+        }
+
+        DrawImpactGlow(batch, targetWorld, pulse);
     }
 
     private static void GetEyePositions(Vector2 bodyCenter, int facingDirection, out Vector2 eyeA, out Vector2 eyeB)
@@ -761,13 +1062,14 @@ internal sealed class ModEntry : Mod
     private static void DrawExtendingLaserLines(
         SpriteBatch batch,
         Vector2 bodyCenter,
-        Vector2 mouseWorld,
+        Vector2 targetWorld,
         float pulse,
-        float extendProgress)
+        float extendProgress,
+        int facingDirection)
     {
-        GetEyePositions(bodyCenter, Game1.player.FacingDirection, out Vector2 eyeA, out Vector2 eyeB);
-        Vector2 tipA = Vector2.Lerp(eyeA, mouseWorld, extendProgress);
-        Vector2 tipB = Vector2.Lerp(eyeB, mouseWorld, extendProgress);
+        GetEyePositions(bodyCenter, facingDirection, out Vector2 eyeA, out Vector2 eyeB);
+        Vector2 tipA = Vector2.Lerp(eyeA, targetWorld, extendProgress);
+        Vector2 tipB = Vector2.Lerp(eyeB, targetWorld, extendProgress);
         DrawStraightLaserBeam(batch, eyeA, tipA, pulse);
         DrawStraightLaserBeam(batch, eyeB, tipB, pulse);
         DrawImpactGlow(batch, tipA, pulse);
@@ -935,5 +1237,15 @@ internal sealed class ModEntry : Mod
             scale: new Vector2(length, thickness),
             effects: SpriteEffects.None,
             layerDepth: 1f);
+    }
+
+    private sealed class RemoteLaserVisual
+    {
+        public Vector2 TargetWorld;
+        public float ExtendProgress;
+        public LaserTrajectoryType Trajectory;
+        public string LocationName = "";
+        public int LastUpdateTick;
+        public bool Active;
     }
 }
